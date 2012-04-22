@@ -8,7 +8,11 @@ class IndexMapper(mapreduce.Mapper):
         map_input.key is a docid
         map_input.value is a string representing the document's contents
         """
-        pass
+        docId = map_input.key
+        doc  = map_input.value
+        words = doc.split()
+        for word in words:
+            mapreduce.Mapper.Output(self,word,docId)
             
 class IndexReducer(mapreduce.Reducer):
     def __init__(self):
@@ -20,7 +24,11 @@ class IndexReducer(mapreduce.Reducer):
         Output key should be a term in the documents.
         Output value should be the term's postings list.
         """
-        pass
+        pos = []
+        for value in reduce_input:
+            pos.append(value)
+            
+        mapreduce.Reducer.Output(self,sorted(pos))
 
 if __name__ == "__main__":
     input_data = [(0, "the quick brown"),
