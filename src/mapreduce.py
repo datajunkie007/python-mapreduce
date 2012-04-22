@@ -1,204 +1,200 @@
+import threading
+import Queue
+import operator
+import urllib
+import re
 
-# Usage: Create a Master object, properly configured in its constructor,
-# and invoke Run() on it.  Invoking Run(1) on the master will also print
-# out some debug output that shows how the run is progressing.
-#
-# Input to the mapreduce is either a list of (key, value) tuples:
-#    [(k1, v1), (k2, v2), ...]
-# or a dictionary whose keys represent shard ids and values are a
-# a list of (key, value) tuples:
-#    {0 : [(k1, v1), (k2, v2)], 1 : [(k3, v3)], ...}
-#
-# Mapreduce output is a dictionary whose keys represent shard ids and values
-# are a list of (key, value) tuples:
-#    {0 : [(k1, v1), (k2, v2)], 1 : [(k3, v3)], ...}
-#
-# Note: This means that the output of a mapreduce can be used as the input
-# to another mapreduce
+class MapReduce:
+    ''' MapReduce - to use, subclass by defining these functions,
+                    then call self.map_reduce():
+        parse_fn(self, k, v) => [(k, v), ...]
+        map_fn(self, k, v) => [(k, v1), (k, v2), ...]
+        reduce_fn(self, k, [v1, v2, ...]) => [(k, v)]
+        output_fn(self, [(k, v), ...])
+    '''
+    def __init__(self):
+        self.data = None
+        self.num_worker_threads = 5
+    
+    class SynchronizedDict(): # we need this for merging
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.d = {}
+        def isin(self, k):
+            with self.lock:
+                if k in self.d:
+                    return True
+                else:
+                    return False
+        def get(self, k):
+            with self.lock:
+                return self.d[k]
+        def set(self, k, v): # we don't need del
+            with self.lock:
+                self.d[k] = v
+        def set_append(self, k, v): # for thread-safe list append
+            with self.lock:
+                self.d[k].append(v)
+        def items(self):
+            with self.lock:
+                return self.d.items()
 
-class Master:
-    def __init__(self, mapper_class, reducer_class, input_data, output_data,
-                 num_workers, num_output_shards, split_size = 2):
-        """Configures the Master with the basic information.
-        output_data must be a dictionary, which is directly modified by
-        this mapreduce.
-        """
-        self.mapper_class = mapper_class
-        self.reducer_class = reducer_class
-        if isinstance(input_data, list):
-            self.input_data = {0 : input_data}
-        elif isinstance(input_data, dict):
-            self.input_data = input_data
+    def create_queue(self, input_list): # helper fn for queues
+        output_queue = Queue.Queue()
+        for value in input_list:
+            output_queue.put(value)
+        return output_queue
+
+    def create_list(self, input_queue): # helper fn for queues
+        output_list = []
+        while not input_queue.empty():
+            item = input_queue.get()
+            output_list.append(item)
+            input_queue.task_done()
+        return output_list
+
+    def merge_fn(self, k, v, merge_dict): # helper fn for merge
+        if merge_dict.isin(k):
+            merge_dict.set_append(k, v)
         else:
-            print "Unknown type of input_data. Expected list or dict."
-        self.output_data = output_data
-        self.num_workers = num_workers
-        self.workers = [Worker(self) for i in range(self.num_workers)]
-        self.num_output_shards = num_output_shards
-        self.split_size = split_size
-        # shuffled_data holds data moved from mappers to reducers.
-        # In a real Mapreduce implementation the shuffle happens on disk in a
-        # distributed manner.
-        self.output_data.clear()
-        self.shuffled_data = {}
-        for i in range(self.num_output_shards):
-            self.output_data[i] = []
-            self.shuffled_data[i] = []
-        self.debug_level = 0
-    def OutputShard(self, key):
-        """Returns the output shard for a map output key."""
-        return hash(key) % self.num_output_shards
-    def Run(self, debug_level=0):
-        self.debug_level = debug_level
-        self.DebugPrint("Splitting input into chunks of size", self.split_size)
-        # Split input data into chunks and assign to a worker to run a mapper.
-        # A real mapreduce implementation would split into 16-64MB chunks
-        self.next_worker_id = 0
-        for shard_id in self.input_data:
-            for i in range(0, len(self.input_data[shard_id]), self.split_size):
-                self.input_data_split = self.input_data[shard_id][i:i + self.split_size]
-                self.DebugPrint("Worker", self.next_worker_id,
-                                ": Running", self.mapper_class.__name__,
-                                "on shard:", shard_id,
-                                "Input data start index:", i)
-                self.workers[self.next_worker_id].RunMapper(self.input_data_split)
-                self.DebugPrint("Worker", self.next_worker_id,
-                                ": Map complete")
-                self.DebugPrint("Worker", self.next_worker_id,
-                                ": Shuffle map output to reduce shards.")
-                self.workers[self.next_worker_id].Shuffle()
-                self.next_worker_id = (self.next_worker_id + 1) % len(self.workers)
-        # Now assign reducers to the workers
-        for shard_id in range(self.num_output_shards):
-            self.DebugPrint("Worker", self.next_worker_id,
-                            ": Sorting keys for reduce shard", shard_id)
-            self.workers[self.next_worker_id].PrepareReduceInput(shard_id)
-            self.DebugPrint("Worker", self.next_worker_id,
-                            ": Running", self.reducer_class.__name__,
-                            "on reduce shard", shard_id)
-            self.workers[self.next_worker_id].RunReducer(shard_id)
-            self.DebugPrint("Worker", self.next_worker_id,
-                            ": Reduce shard", shard_id, "complete")
-            self.next_worker_id = (self.next_worker_id + 1) % len(self.workers)
-        self.DebugPrint("Mapreduce complete.")
-        self.debug_level = 0
-    def DebugPrint(self, *args):
-        if self.debug_level > 0:
-            for arg in args:
-                print arg,
-            print ""
+            merge_dict.set(k, [v])
 
-class Worker:
-    def __init__(self, mapreduce_master):
-        self.master = mapreduce_master
-    def RunMapper(self, input_data_split):
-        self.mapper = self.master.mapper_class()
-        self.mapper.worker = self
-        self.mapper.InitOutput()
-        for key, value in input_data_split:
-            self.map_input = MapInput(key, value)
-            self.mapper.Map(self.map_input)
-    def Shuffle(self):
-        """Copy mapper output so reducers can work on it."""
-        for shard_id in self.mapper.output:
-            self.master.shuffled_data[shard_id].extend(self.mapper.output[shard_id])
-    def RunReducer(self, shard_id):
-        self.shard_id = shard_id
-        self.reducer = self.master.reducer_class()
-        self.reducer.worker = self
-        for key in self.prepared_dict:
-            self.reduce_input = ReduceInput(key, self.prepared_dict[key])
-            self.reducer.Reduce(self.reduce_input)
-    def PrepareReduceInput(self, shard_id):
-        self.key_values = self.master.shuffled_data[shard_id]
-        self.key_values.sort(None, lambda x: x[0])
-        self.prepared_dict = {}
-        for key, value in self.key_values:
-            if isinstance(key, CompositeKey):
-                key = key.key
-            if key in self.prepared_dict:
-                self.prepared_dict[key].append(value)
-            else:
-                self.prepared_dict[key] = [value]
+    def process_queue(self, input_queue, fn_selector): # helper fn
+        output_queue = Queue.Queue()
+        if fn_selector == 'merge':
+            merge_dict = self.SynchronizedDict()
+        def worker():
+            while not input_queue.empty():
+                (k, v) = input_queue.get()
+                if fn_selector in ['map', 'reduce']:
+                    if fn_selector == 'map':
+                        result_list = self.map_fn(k, v)
+                    elif fn_selector == 'reduce':
+                        result_list = self.reduce_fn(k, v)
+                    for result_tuple in result_list: # flatten
+                        output_queue.put(result_tuple)
+                elif fn_selector == 'merge': # merge v to same k
+                    self.merge_fn(k, v, merge_dict)
+                else:
+                    raise Exception, "Bad fn_selector="+fn_selector
+                input_queue.task_done()
+        for i in range(self.num_worker_threads): # start threads
+            worker_thread = threading.Thread(target=worker)
+            worker_thread.daemon = True
+            worker_thread.start()
+        input_queue.join() # wait for worker threads to finish
+        if fn_selector == 'merge':
+            output_list = sorted(merge_dict.items(), key=operator.itemgetter(0))
+            output_queue = self.create_queue(output_list)
+        return output_queue
+
+    def map_reduce(self): # the actual map-reduce algoritm
+        data_list = self.parse_fn(self.data)
+        data_queue = self.create_queue(data_list) # enqueue the data so we can multi-process
+        map_queue = self.process_queue(data_queue, 'map') # [(k,v),...] => [(k,v1),(k,v2),...]
+        merge_queue = self.process_queue(map_queue, 'merge') # [(k,v1),(k,v2),...] => [(k,[v1,v2,...]),...]
+        reduce_queue = self.process_queue(merge_queue, 'reduce') # [(k,[v1,v2,...]),...] => [(k,v),...]
+        output_list = self.create_list(reduce_queue) # deque into list for output handling
+        self.output_fn(output_list)
+
+
+class WordCount(MapReduce):
+
+    def __init__(self):
+        MapReduce.__init__(self)
+        self.min_count = 1
+
+    def parse_fn(self, data): # break string into [(k, v), ...] tuples for each line
+        data_list = map(lambda line: (None, line), data.splitlines());
+        return data_list
+   
+    def map_fn(self, key, str): # return (word, 1) tuples for each word, ignore key
+        word_list = []
+        for word in re.split(r'\W+', str.lower()):
+            bare_word = re.sub(r"[^A-Za-z0-9]*", r"", word);
+            if len(bare_word) > 0:
+                word_list.append((bare_word, 1))
+        return word_list
+   
+    def reduce_fn(self, word, count_list): # just sum the counts
+        return [(word, sum(count_list))]
+
+    def output_fn(self, output_list): # just print the resulting list
+        print "Word".ljust(15), "Count".rjust(5)
+        print "______________".ljust(15), "_____".rjust(5)
+        sorted_list = sorted(output_list, key=operator.itemgetter(1), reverse=True)
+        for (word, count) in sorted_list:
+            if count > self.min_count:
+                print word.ljust(15), repr(count).rjust(5)
+        print
+
+    def test_with_monty(self):
+        self.data = """The Meaning of Life is:
+            try and be nice to people,
+            avoid eating fat,
+            read a good book every now and then,
+            get some walking in,
+            and try and live together in peace and harmony
+            with people of all creeds and nations."""
+        self.map_reduce()
+ 
+    def test_with_nietzsche(self):
+        self.min_count = 700
+        f = urllib.urlopen("http://www.gutenberg.org/cache/epub/7205/pg7205.txt")
+        self.data = f.read()
+        f.close()
+        self.map_reduce()
+
+
+class DistributedGrep(MapReduce):
+
+    def __init__(self):
+        MapReduce.__init__(self)
+        self.matcher = None
+
+    def parse_fn(self, data): # one list item per line with line number
+        data_list = []
+        line_num = 1
+        for line in data.splitlines():
+            data_list.append((line_num, line))
+            line_num = line_num + 1
+        return data_list
+ 
+    def map_fn(self, line_num, line): # return line if matches, include line num
+        matcher = self.matcher
+        matched_line = []
+        if matcher.match(line):
+            matched_line = [(line_num, line)]
+        return matched_line
+
+    def reduce_fn(self, line_num, line_list): # identity reducer
+        return [(line_num, line_list[0])] # we only ever have one line in the list
+
+    def output_fn(self, output_list): # just print the resulting list
+        print "LineNum".rjust(8), "Line".ljust(70)
+        print "_______".rjust(8), "____"
+        for (line_num, line) in sorted(output_list, key=operator.itemgetter(0)):
+            print repr(line_num).rjust(8), line.ljust(70)
+        print
+
+    def test_with_nietzsche(self):
+        self.matcher = re.compile(r".*Jahre.*")
+        f = urllib.urlopen("http://www.gutenberg.org/cache/epub/7205/pg7205.txt")
+        self.data = f.read()
+        f.close()
+        self.map_reduce()
+
+
+def main():
+    wc = WordCount()
+    wc.test_with_monty()
+    wc.test_with_nietzsche()
+    
+    dg = DistributedGrep()
+    dg.test_with_nietzsche()
         
-
-class MapInput:
-    def __init__(self, key, value):
-        self.key = key
-        self.value = value
-
-class ReduceInput:
-    def __init__(self, key, values):
-        self.key = key
-        self.values = values
-    def __iter__(self):
-        return iter(self.values)
-
-class CompositeKey:
-    def __init__(self, key, secondary_key):
-        self.key = key
-        self.secondary_key = secondary_key
-    def __cmp__(self, other):
-        if (self.key < other.key):
-            return -1
-        elif self.key == other.key:
-            if self.secondary_key < other.secondary_key:
-                return -1
-            elif self.secondary_key == other.secondary_key:
-                return 0
-            else:
-                return 1
-        else:
-            return 1
-
-class Mapper:
-    def __init__(self):
-        # Worker should set this when it instantiates the mapper.  Worker
-        # should also call InitOutput() at that time
-        self.worker = None
-    def InitOutput(self):
-        # Map output from this mapper gets written to the self.output as follows:
-        #   {0 : [(k1, v1), (k2, v2), (k1, v3)], 1 : [(k4, v4)], ...}
-        #
-        # In a real Mapreduce implementation, this dictionary would be written
-        # to files on the local disk, partitioned into regions with one region
-        # per output shard.
-        self.output = {}
-        for i in range(self.worker.master.num_output_shards):
-            self.output[i] = []
-    def Output(self, key, value):
-        """Call this method to output (key, value) pairs from this mapper.
-        """
-        self.shard_id = self.worker.master.OutputShard(key)
-        self.output[self.shard_id].append((key, value))
-    def OutputWithSecondaryKey(self, key, secondary_key, value):
-        """Call this method if you want the values for a particular key
-        to be also sorted by secondary_key.
-        """
-        self.shard_id = self.worker.master.OutputShard(key)
-        self.output[self.shard_id].append((CompositeKey(key, secondary_key),
-                                           value))
-    def Map(self, map_input):
-        """Derived classes should override this method.
-        map_input.key and map_input.value provide the input (key, value) pairs.
-        """
-        pass
+if __name__ == "__main__":
+    main()
 
 
-class Reducer:
-    def __init__(self):
-        self.worker = None
-    def Reduce(self, reduce_input):
-        """Derived classes should override this method.
-        You can iterate through the values simply as follows:
-            for v in reduce_input:
-                ...
-        You can also get to the key using reduce_input.key
-        """
-        pass
-    def Output(self, value):
-        """Call this method to output the value for this reduce_input.  Note that
-        you can't specify the key---it will be reduce_input.key
-        """
-        self.shard_data = self.worker.master.output_data[self.worker.shard_id]
-        self.shard_data.append((self.worker.reduce_input.key, value))
+
