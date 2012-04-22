@@ -28,7 +28,7 @@ class CountWordsReducer(mapreduce.Reducer):
         for value in reduce_input:
             total  = total + value
             
-        print reduce_input
+        mapreduce.Reducer.Output(self,total)
             
               
 if __name__ == "__main__":

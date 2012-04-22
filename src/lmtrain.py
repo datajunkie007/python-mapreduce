@@ -10,8 +10,16 @@ class LMMapper(mapreduce.Mapper):
         map_input.key is a docid
         map_input.value is a string representing the document's contents
         """
-        pass
-
+        split = map_input.value.split()
+        for i in range (len(split) - 1):
+            mapreduce.Mapper.Output(self,split[i],1)
+            mapreduce.Mapper.Output(self,(split[i],split[i+1]),1)
+            mapreduce.Mapper.Output(self,"__num_bigrams__",1)
+            mapreduce.Mapper.Output(self,"__num_unigrams__",1)            
+        mapreduce.Mapper.Output(self,split[len(split)-1],1)
+        mapreduce.Mapper.Output(self,"__num_unigrams__",1)            
+        
+        
 class LMReducer(mapreduce.Reducer):
     def Reduce(self, reduce_input):
         """
@@ -20,7 +28,12 @@ class LMReducer(mapreduce.Reducer):
         represent the number of unigrams and bigrams, respectively
         The value should be the count of that unigram/bigram.
         """
-        pass
+        total = 0
+
+        for value in reduce_input:
+            total  = total + value
+            
+        mapreduce.Reducer.Output(self,total)
 
 if __name__ == "__main__":
     input_data = [(0, "the quick brown"),
